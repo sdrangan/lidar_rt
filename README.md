@@ -4,27 +4,73 @@ Turn a lidar point cloud of an indoor space (e.g. a [GLIM](https://github.com/ko
 clean, low-polygon **2.5D building model** — floor, ceiling, walls with door openings — that can be loaded
 directly into a ray tracer such as [Sionna RT](https://nvlabs.github.io/sionna/rt/).
 
+![pipeline](docs/pipeline.png)
+
 Instead of fitting planes in 3D with RANSAC (which tends to miss the floor and short walls, and produces
-spurious slanted planes through clutter), the pipeline treats the building as a floor plan:
+spurious slanted planes through clutter), the pipeline treats the building as a **floor plan** and then
+extrudes it. All figures below come from the included synthetic office
+(`python make_figures.py synthetic_office.npy docs` regenerates them).
 
-1. Clean the cloud (voxel downsample, statistical outlier removal).
-2. Find **floor and ceiling heights** from peaks in the z-histogram.
-3. Find the **dominant wall direction** (Manhattan alignment) from 2D local PCA in a wall slice.
-4. Project a horizontal slice (0.9 m above floor → just below ceiling) onto a 2D density image.
-   Including the band above door height lets lintels bridge doorways and walls occluded by furniture.
-5. Extract **straight wall segments** with morphological line filtering (long thin opening kernels).
-6. Merge the two faces of each wall, bridge small gaps, **reject partial-height structures**
-   (desks, cabinets, ducts must reach both floor *and* ceiling to count as walls), snap corners.
-7. Detect **door openings**: runs along a wall with no points at standing height. Closed doors return
-   points, so they stay solid.
-8. Extrude walls floor→ceiling (lintels above doors), add floor/ceiling slabs, rotate back to the
-   original map frame, and export PLY meshes plus a Sionna RT `scene.xml` with ITU radio materials.
+## How it works
 
-| Extracted floor plan (red = walls, green = doors) | Sionna RT radio map, 3.5 GHz |
-|---|---|
-| ![floor plan](docs/floorplan_debug.png) | ![radio map](docs/radio_map.png) |
+### 1. Input point cloud
+The dense map from GLIM (or any SLAM system), gravity-aligned with z up. The cloud is voxel-downsampled
+and statistical outliers are removed. The synthetic test map is deliberately rotated 23° and offset, has
+sparse floor returns, desks and cabinets, ceiling clutter, occlusion holes and noise.
 
-*(Both images are from the included synthetic office test.)*
+<img src="docs/1_input.png" width="600">
+
+### 2. Floor and ceiling from the height histogram
+Horizontal surfaces produce sharp peaks in the histogram of z; walls spread evenly over z. The strongest
+peak in the lower half is the floor and in the upper half the ceiling. This works even when the floor is
+sparsely sampled, which is where 3D RANSAC usually fails. The shaded band is the wall slice used next:
+from 0.9 m above the floor (above desks) to 0.25 m below the ceiling (below lights). Including the band
+above door height means the wall above a door still shows up, so walls are not broken at doorways
+or behind furniture.
+
+<img src="docs/2_height_hist.png" width="600">
+
+### 3. Manhattan alignment and 2D density image
+Local 2D PCA on the slice gives a line direction at every point; a histogram of those directions folded
+modulo 90° gives the building orientation. The slice is rotated so the walls are axis-aligned and
+rasterized into a density image (4 cm pixels).
+
+<img src="docs/3_slice_density.png" width="600">
+
+### 4. Long straight runs
+A morphological *close* along each axis bridges small holes in a wall, then an *open* with a long, thin
+kernel (≥ 0.6 m) keeps only straight runs at least that long. Each connected component becomes a raw
+segment. Furniture still produces many short segments at this stage.
+
+<img src="docs/4_line_filter.png" width="600">
+
+### 5. Merge, reject furniture, snap corners, find doors
+- Parallel segments closer than 0.3 m (the two faces of one wall) are merged.
+- A segment is kept only if the **full cloud** has points along it both near the floor and near the
+  ceiling. Desks and cabinets fail the high test; ceiling ducts and lights fail the low test.
+- Endpoints are snapped onto perpendicular walls to close corners.
+- **Doors** are runs along a wall with no points at standing height (0.3–1.9 m above the floor) that are
+  0.6–2.0 m wide. The top of the door is taken from the lowest points above it. Closed doors return
+  points, so they stay solid. In the synthetic data, three doorways have a desk or cabinet in them and
+  are therefore (correctly) left closed.
+
+<img src="docs/5_walls_doors.png" width="600">
+
+### 6. Extrude and export
+Walls are extruded from floor to ceiling, with a section left above each door opening, and floor and
+ceiling slabs are added. The model is rotated back into the **original map frame** and written as PLY
+meshes plus a Sionna RT `scene.xml` with ITU radio materials (plasterboard walls, concrete floor,
+ceiling board by default). The small slits visible in some walls are large full-height occlusion holes in
+the synthetic data; increase `--gap` to bridge them.
+
+<img src="docs/6_model_3d.png" width="500">
+
+### 7. Ray tracing
+The scene loads directly in Sionna RT. A 3.5 GHz radio map with the transmitter in the corridor shows the
+expected behaviour: the corridor guides the signal, it leaks into offices through the doorways, and
+it drops behind each wall.
+
+<img src="docs/radio_map.png" width="550">
 
 ## Installation
 
@@ -100,6 +146,7 @@ See `test_sionna.py` for a complete example including a radio map.
 python make_synthetic_office.py                     # writes synthetic_office.npy
 python cloud_to_floorplan.py synthetic_office.npy -o test_scene
 python test_sionna.py test_scene/scene.xml          # traces paths, writes radio_map_test.png
+python make_figures.py synthetic_office.npy docs    # regenerates the figures in this README
 ```
 
 The synthetic office has 11 walls with 7 doorways, desks and cabinets, ceiling clutter, sparse floor
