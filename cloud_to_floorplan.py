@@ -11,9 +11,12 @@ Pipeline
   5. Extract axis-aligned wall segments (morphological line filtering)
   6. Merge two-sided walls, close gaps, reject furniture (must reach floor AND
      ceiling), snap corners, detect door openings
-  7. Extrude walls floor->ceiling, add floor/ceiling slabs, rotate back to the
+  7. Furniture: cluster the leftover points, fit an oriented box to each
+     cluster (desks/tables become thin slabs at the top, tall cabinets get
+     their own material)
+  8. Extrude walls floor->ceiling, add floor/ceiling slabs, rotate back to the
      original (GLIM) frame
-  8. Export PLY meshes + Sionna RT scene XML + a debug PNG
+  9. Export PLY meshes + Sionna RT scene XML + a debug PNG
 
 Assumes z is (roughly) gravity-up, which is true for GLIM maps built with an IMU.
 Assumes a Manhattan (rectilinear) building; for diagonal walls see the note in
@@ -61,9 +64,12 @@ def remove_outliers(pts, k=16, std_ratio=2.0):
 # ---------------------------------------------------------------------------
 # 2. Floor / ceiling
 # ---------------------------------------------------------------------------
-def floor_ceiling(z, bin_size=0.02):
-    """Floor = strongest z-peak in the lower half, ceiling = strongest in the upper.
-    Horizontal surfaces create sharp peaks; walls spread evenly over z."""
+def floor_ceiling(z, bin_size=0.02, rel=0.2):
+    """Horizontal surfaces create sharp peaks in the z-histogram; walls spread evenly.
+    Floor   = LOWEST peak in the lower half that is at least `rel` x the strongest
+              lower peak (desk tops can out-number a sparsely-seen floor, but they
+              are always above it).
+    Ceiling = HIGHEST such peak in the upper half (cabinet tops are below it)."""
     bins = np.arange(z.min(), z.max() + bin_size, bin_size)
     h, e = np.histogram(z, bins)
     c = 0.5 * (e[1:] + e[:-1])
@@ -73,8 +79,16 @@ def floor_ceiling(z, bin_size=0.02):
     mid = 0.5 * (z.min() + z.max())
     lo = [p for p in peaks if c[p] < mid]
     hi = [p for p in peaks if c[p] >= mid]
-    floor = c[max(lo, key=lambda p: h[p])] if lo else np.percentile(z, 1)
-    ceil = c[max(hi, key=lambda p: h[p])] if hi else np.percentile(z, 99)
+    if lo:
+        hmax = max(h[p] for p in lo)
+        floor = c[min(p for p in lo if h[p] >= rel * hmax)]
+    else:
+        floor = np.percentile(z, 1)
+    if hi:
+        hmax = max(h[p] for p in hi)
+        ceil = c[max(p for p in hi if h[p] >= rel * hmax)]
+    else:
+        ceil = np.percentile(z, 99)
     return float(floor), float(ceil)
 
 
@@ -246,6 +260,120 @@ def find_doors(seg, P, fz, cz, halfw, door_w=(0.6, 2.0), bin_=0.05, min_pts=3):
 
 
 # ---------------------------------------------------------------------------
+# 6c. Furniture: boxes fitted to clusters of leftover points
+# ---------------------------------------------------------------------------
+def _rect(cells, origin, res):
+    """Oriented rectangle (4 corners, aligned frame) around grid cells (x, y) index pairs."""
+    (cx, cy), (w, d), ang = cv2.minAreaRect(cells.astype(np.float32))
+    w, d = (w + 1) * res, (d + 1) * res
+    ctr = origin + (np.array([cx, cy]) + 0.5) * res
+    a = np.radians(ang)
+    u, v = np.array([np.cos(a), np.sin(a)]), np.array([-np.sin(a), np.cos(a)])
+    return np.array([ctr + sx * w / 2 * u + sy * d / 2 * v
+                     for sx, sy in [(-1, -1), (1, -1), (1, 1), (-1, 1)]]), w * d
+
+
+def extract_furniture(P, segs, fz, cz, halfw, res=0.05, min_pts=30, min_area=0.04,
+                      min_h=0.2, top_margin=0.3, tall_h=1.4,
+                      table_h=(0.55, 1.1), table_min_area=0.35, table_max_solid=0.4):
+    """Simplified furniture from the points left after removing floor, ceiling,
+    ceiling clutter and walls (aligned frame).
+
+    Pass 1 - tables/desks: on a top-height map (max z per cell), find large flat
+      regions at desk height whose EDGE cells mostly have nothing below the top
+      (only legs). These become thin slabs at the top, so rays can pass
+      underneath. A low cabinet has side panels all around its perimeter and
+      fails this test; a chair tucked under a desk does not affect it.
+    Pass 2 - everything else (chairs, cabinets, boxes): connected clusters, one
+      solid oriented box each, floor to top. 'tall' if height >= tall_h.
+    Returns list of dicts: corners (4x2), z0, z1, kind in {'table','object','tall'}.
+    """
+    z = P[:, 2]
+    Q = P[(z > fz + 0.05) & (z < cz - top_margin)]
+    near = np.zeros(len(Q), bool)
+    pad = halfw + 0.1
+    for s in segs:
+        axis, off, a, b = s[:4]
+        u, v = (Q[:, 0], Q[:, 1]) if axis == 0 else (Q[:, 1], Q[:, 0])
+        near |= (np.abs(v - off) < pad) & (u > a - pad) & (u < b + pad)
+    Q = Q[~near]
+    if len(Q) == 0:
+        return []
+
+    origin = Q[:, :2].min(0) - 2 * res
+    ij = np.floor((Q[:, :2] - origin) / res).astype(int)
+    shape = (ij[:, 1].max() + 3, ij[:, 0].max() + 3)
+    cnt = np.zeros(shape, np.int32)
+    np.add.at(cnt, (ij[:, 1], ij[:, 0]), 1)
+    top = np.full(shape, -np.inf)
+    np.maximum.at(top, (ij[:, 1], ij[:, 0]), Q[:, 2])
+    below = np.zeros(shape, np.int32)                      # points well below the cell top
+    bm = Q[:, 2] < top[ij[:, 1], ij[:, 0]] - 0.15
+    np.add.at(below, (ij[bm, 1], ij[bm, 0]), 1)
+    occ = cnt >= 2
+    out = []
+
+    # ---- pass 1: table tops
+    cand = occ & (top > fz + table_h[0]) & (top < fz + table_h[1])
+    cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+    cand &= np.isfinite(top) | ~occ
+    table_mask = np.zeros(shape, bool)
+    n, lab = cv2.connectedComponents(cand.astype(np.uint8), connectivity=8)
+    for k in range(1, n):
+        comp = (lab == k) & occ
+        if comp.sum() == 0:
+            continue
+        zt = np.median(top[comp])
+        flat = (lab == k) & (~occ | (np.abs(top - zt) < 0.05))  # same height (holes allowed)
+        n2, lab2 = cv2.connectedComponents(flat.astype(np.uint8), connectivity=8)
+        for k2 in range(1, n2):
+            cells = lab2 == k2
+            area = cells.sum() * res * res
+            seen = cells & occ
+            if area < table_min_area or seen.sum() == 0:
+                continue
+            c8 = cells.astype(np.uint8)
+            edge = (c8 - cv2.erode(c8, np.ones((5, 5), np.uint8))) > 0   # 2-cell rim
+            solid = np.mean(below[edge] >= 2)
+            if solid > table_max_solid:
+                continue
+            corners, _ = _rect(np.argwhere(cells)[:, ::-1], origin, res)
+            ztop = float(np.percentile(top[seen], 90))
+            out.append(dict(corners=corners, z0=ztop - 0.04, z1=ztop, kind="table"))
+            table_mask |= cells
+
+    # ---- pass 2: remaining clusters -> boxes (table footprints, incl. legs, removed)
+    tm = cv2.dilate(table_mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    rest = occ & ~tm
+    rest = cv2.morphologyEx(rest.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    rest &= ~tm
+    n, lab = cv2.connectedComponents(rest.astype(np.uint8), connectivity=8)
+    plab = lab[ij[:, 1], ij[:, 0]]
+    for k in range(1, n):
+        m = plab == k
+        if m.sum() < min_pts:
+            continue
+        corners, area = _rect(np.argwhere(lab == k)[:, ::-1], origin, res)
+        if area < min_area:
+            continue
+        ztop = float(np.percentile(Q[m, 2], 98))
+        h = ztop - fz
+        if h < min_h:
+            continue
+        out.append(dict(corners=corners, z0=fz, z1=ztop, kind="tall" if h >= tall_h else "object"))
+    return out
+
+
+def box_mesh(corners, z0, z1):
+    """Closed box from 4 footprint corners (counter-clockwise) and a z range."""
+    V = np.vstack([np.c_[corners, np.full(4, z0)], np.c_[corners, np.full(4, z1)]])
+    F = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                  [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
+                  [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]])
+    return V, F
+
+
+# ---------------------------------------------------------------------------
 # 7. Meshing
 # ---------------------------------------------------------------------------
 def seg_to_xy(s):
@@ -350,6 +478,10 @@ def main(argv=None):
     ap.add_argument("--no-doors", action="store_true", help="do not carve door openings")
     ap.add_argument("--keep-partial", action="store_true",
                     help="keep segments that do not reach floor and ceiling (cubicles, cabinets)")
+    ap.add_argument("--furniture", action="store_true",
+                    help="add simplified boxes for desks, chairs, cabinets (off by default)")
+    ap.add_argument("--furniture-material", default="wood", help="material for desks, chairs, ...")
+    ap.add_argument("--tall-material", default="metal", help="material for tall objects (cabinets)")
     ap.add_argument("--wall-material", default="plasterboard")
     ap.add_argument("--wall-material-thickness", type=float, default=0.12)
     a = ap.parse_args(argv)
@@ -388,6 +520,10 @@ def main(argv=None):
     segs = [s for s in segs if s[3] - s[2] >= a.min_len]
     doors = [[] if a.no_doors else find_doors(s, P_al, fz, cz, halfw) for s in segs]
     print(f"final walls: {len(segs)}, door openings: {sum(map(len, doors))}")
+    furn = extract_furniture(P_al, segs, fz, cz, halfw) if a.furniture else []
+    if a.furniture:
+        kinds = {k: sum(f["kind"] == k for f in furn) for k in ("table", "object", "tall")}
+        print(f"furniture boxes: {len(furn)}  {kinds}")
 
     # --- meshes in world frame
     Rinv = R.T
@@ -407,11 +543,19 @@ def main(argv=None):
     write_ply(os.path.join(a.out, "meshes", "walls.ply"), Vw, Fw)
     write_ply(os.path.join(a.out, "meshes", "floor.ply"), Vf, Fq)
     write_ply(os.path.join(a.out, "meshes", "ceiling.ply"), Vc, Fq[:, ::-1])
-    write_sionna_xml(os.path.join(a.out, "scene.xml"), [
+    objects = [
         ("walls", "meshes/walls.ply", a.wall_material, a.wall_material_thickness),
         ("floor", "meshes/floor.ply", "concrete", 0.2),
         ("ceiling", "meshes/ceiling.ply", "ceiling_board", 0.02),
-    ])
+    ]
+    for name, sel, mat, th in [("furniture", ("table", "object"), a.furniture_material, 0.03),
+                               ("furniture_tall", ("tall",), a.tall_material, 0.002)]:
+        fs = [f for f in furn if f["kind"] in sel]
+        if fs:
+            V, F = concat([box_mesh(f["corners"] @ Rinv.T, f["z0"], f["z1"]) for f in fs])
+            write_ply(os.path.join(a.out, "meshes", f"{name}.ply"), V, F)
+            objects.append((name, f"meshes/{name}.ply", mat, th))
+    write_sionna_xml(os.path.join(a.out, "scene.xml"), objects)
 
     # --- debug image: density + occupancy + walls (aligned frame)
     vis = cv2.cvtColor(np.clip(img * 40, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
@@ -422,6 +566,10 @@ def main(argv=None):
         for d0, d1, _ in dd:
             q = ((seg_to_xy([s[0], s[1], d0, d1]) - origin) / a.res).astype(int)
             cv2.line(vis, tuple(q[0]), tuple(q[1]), (0, 255, 0), 3)
+    colors = {"table": (255, 200, 0), "object": (255, 0, 255), "tall": (0, 165, 255)}
+    for f in furn:
+        q = ((f["corners"] - origin) / a.res).astype(np.int32)
+        cv2.polylines(vis, [q], True, colors[f["kind"]], 1)
     cv2.imwrite(os.path.join(a.out, "floorplan_debug.png"), cv2.flip(vis, 0))
 
     with open(os.path.join(a.out, "walls.csv"), "w") as f:

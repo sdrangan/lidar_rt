@@ -21,9 +21,10 @@ sparse floor returns, desks and cabinets, ceiling clutter, occlusion holes and n
 <img src="docs/1_input.png" width="600">
 
 ### 2. Floor and ceiling from the height histogram
-Horizontal surfaces produce sharp peaks in the histogram of z; walls spread evenly over z. The strongest
-peak in the lower half is the floor and in the upper half the ceiling. This works even when the floor is
-sparsely sampled, which is where 3D RANSAC usually fails. The shaded band is the wall slice used next:
+Horizontal surfaces produce sharp peaks in the histogram of z; walls spread evenly over z. The floor is
+the *lowest* strong peak in the lower half and the ceiling the *highest* strong peak in the upper half
+(desk tops can outnumber a sparsely seen floor, but they are always above it). This works even when the
+floor is sparsely sampled, which is where 3D RANSAC usually fails. The shaded band is the wall slice used next:
 from 0.9 m above the floor (above desks) to 0.25 m below the ceiling (below lights). Including the band
 above door height means the wall above a door still shows up, so walls are not broken at doorways
 or behind furniture.
@@ -51,8 +52,7 @@ segment. Furniture still produces many short segments at this stage.
 - Endpoints are snapped onto perpendicular walls to close corners.
 - **Doors** are runs along a wall with no points at standing height (0.3–1.9 m above the floor) that are
   0.6–2.0 m wide. The top of the door is taken from the lowest points above it. Closed doors return
-  points, so they stay solid. In the synthetic data, three doorways have a desk or cabinet in them and
-  are therefore (correctly) left closed.
+  points, so they stay solid. A doorway blocked by furniture is (correctly) left closed.
 
 <img src="docs/5_walls_doors.png" width="600">
 
@@ -65,7 +65,38 @@ the synthetic data; increase `--gap` to bridge them.
 
 <img src="docs/6_model_3d.png" width="500">
 
-### 7. Ray tracing
+### 7. Optional: simplified furniture (`--furniture`)
+With `--furniture`, the points left over after removing floor, ceiling, ceiling clutter and walls are
+turned into simple objects:
+
+- **Desks / tables → thin slabs.** On a top-height map (highest point per 5 cm cell), large flat regions
+  at desk height (0.55–1.1 m) whose *edges* have nothing underneath except legs become a 4 cm slab at
+  the top, so rays can still pass under them. A low cabinet has side panels all around its edge and fails
+  this test; a chair pushed under a desk doesn't affect it.
+- **Everything else → oriented boxes.** Remaining clusters (chairs, cabinets, printers, boxes, ...) each
+  get a solid box from the floor to their top, rotated to fit the cluster.
+- **Materials:** desks, chairs and low objects use `--furniture-material` (default `wood`); objects
+  taller than 1.4 m (filing cabinets, shelving) use `--tall-material` (default `metal`). They are
+  written as separate meshes (`furniture.ply`, `furniture_tall.ply`) so materials can be changed later.
+
+<img src="docs/7_furniture_plan.png" width="600">
+
+The same reconstruction without (default) and with `--furniture`:
+
+![model comparison](docs/8_model_compare.png)
+
+Furniture matters most at mmWave. At 28 GHz with an access point near the ceiling in the corridor, it
+casts shadows of up to about 20 dB (red) and adds some new reflection paths (blue). At sub-6 GHz the walls
+dominate and furniture is usually a second-order effect.
+
+![radio map comparison](docs/9_radio_compare.png)
+
+Furniture boxes are deliberately crude, and they are only as good as what the lidar saw. Objects that move
+(chairs, people walking by during mapping) leave partial or ghost clusters, so check
+`floorplan_debug.png`, where desks are drawn in cyan, chairs and other objects in magenta, and tall
+objects in orange.
+
+### 8. Ray tracing
 The scene loads directly in Sionna RT. A 3.5 GHz radio map with the transmitter in the corridor shows the
 expected behaviour: the corridor guides the signal, it leaks into offices through the doorways, and
 it drops behind each wall.
@@ -99,6 +130,7 @@ Outputs in `office_scene/`:
 |---|---|
 | `scene.xml` | Sionna RT / Mitsuba scene with ITU radio materials |
 | `meshes/walls.ply`, `floor.ply`, `ceiling.ply` | Meshes, in the **same frame as the input map** |
+| `meshes/furniture.ply`, `furniture_tall.ply` | Furniture boxes (only with `--furniture`) |
 | `walls.csv` | Wall endpoints (x0, y0, x1, y1) in the map frame, for inspection or hand-editing |
 | `floorplan_debug.png` | Density image with detected walls (red) and doors (green), in the aligned frame |
 
@@ -137,6 +169,9 @@ See `test_sionna.py` for a complete example including a radio map.
 | `--no-doors` | off | Don't carve door openings |
 | `--keep-partial` | off | Keep segments that don't reach floor and ceiling (cubicle partitions, etc.) |
 | `--wall-thickness` | 0 | 0 = thin quads (thickness only in the material); >0 = box walls [m] |
+| `--furniture` | off | Add simplified desks (slabs), chairs/objects and cabinets (boxes) |
+| `--furniture-material` | wood | Material for desks, chairs, low objects |
+| `--tall-material` | metal | Material for objects taller than 1.4 m |
 | `--wall-material` | plasterboard | Sionna ITU material for walls (`concrete`, `brick`, `glass`, `wood`, ...) |
 | `--wall-material-thickness` | 0.12 | Material thickness used for transmission [m] |
 
@@ -146,12 +181,14 @@ See `test_sionna.py` for a complete example including a radio map.
 python make_synthetic_office.py                     # writes synthetic_office.npy
 python cloud_to_floorplan.py synthetic_office.npy -o test_scene
 python test_sionna.py test_scene/scene.xml          # traces paths, writes radio_map_test.png
+python cloud_to_floorplan.py synthetic_office.npy -o test_scene_f --furniture   # with furniture
 python make_figures.py synthetic_office.npy docs    # regenerates the figures in this README
 ```
 
-The synthetic office has 11 walls with 7 doorways, desks and cabinets, ceiling clutter, sparse floor
-returns, occlusion holes, noise, and an arbitrary yaw/offset. All walls are recovered; doorways blocked
-by furniture in the synthetic data are (correctly) left closed.
+The synthetic office has 11 walls with 7 doorways, 14 desks (top + legs), 14 chairs (seat + back, random
+orientation), 8 cabinets, ceiling clutter, sparse floor returns, occlusion holes, noise, and an arbitrary
+yaw/offset. All walls and all 7 doors are recovered. With `--furniture`, all 8 cabinets are found, and
+the 14 desks come out as 9 slabs because desks that overlap in the random placement merge into one.
 
 ## Limitations and tips
 
@@ -166,6 +203,6 @@ by furniture in the synthetic data are (correctly) left closed.
 - **Materials.** Everything is one wall material by default. Splitting walls by material (concrete
   exterior vs. drywall interior, glass, metal) usually matters more for RF accuracy than small
   geometry errors.
-- **Furniture.** Removed on purpose. At mmWave it can matter; a decimated mesh of the clutter (e.g.
-  Poisson or TSDF reconstruction of the residual points) can be added as an extra object.
+- **Furniture.** Off by default; `--furniture` adds simple boxes and slabs. For more detail, a decimated
+  mesh of the leftover points (e.g. Poisson or TSDF reconstruction) can be added as an extra object.
 - **Validate** against a few channel measurements (path loss / PDP) before trusting the model.
