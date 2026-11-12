@@ -5,3 +5,5 @@ scene_out/
 test_scene/
 *_scene/
 radio_map_test.png
+scene_*/
+test_scene*/
