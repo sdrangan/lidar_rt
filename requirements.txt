@@ -1,0 +1,6 @@
+numpy
+scipy
+opencv-python
+open3d
+sionna-rt
+matplotlib
