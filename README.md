@@ -103,6 +103,12 @@ it drops behind each wall.
 
 <img src="docs/radio_map.png" width="550">
 
+## Plans
+
+- [Real-to-sim calibration of the path-estimation simulator](plans/real_to_sim.md): using real TX/RX robot
+  measurements in a `lidar_rt` scene to calibrate a Sionna-based simulator of `est_paths()` output, without
+  and with motion capture.
+
 ## Installation
 
 ```bash
